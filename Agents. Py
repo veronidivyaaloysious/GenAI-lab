@@ -1,0 +1,262 @@
+src/slo_agent.py
+
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+from pathlib import Path
+import numpy as np
+import pandas as pd
+from datetime import timedelta
+import matplotlib.pyplot as plt
+
+# Stats
+from scipy.stats import ks_2samp
+from statsmodels.tsa.arima.model import ARIMA
+
+# Lang + LLM
+try:
+    # Preferred modern integration (langchain-ollama)
+    from langchain_ollama import OllamaLLM
+    def make_llm(model_name):
+        return OllamaLLM(model=model_name)
+except Exception:
+    try:
+        from langchain.llms import Ollama
+        def make_llm(model_name):
+            return Ollama(model=model_name)
+    except Exception:
+        OllamaLLM = None
+        def make_llm(model_name):
+            raise RuntimeError("Install an Ollama LangChain integration (langchain-ollama or langchain_ollama)")
+
+# local imports
+from models import SLOTargetsFile
+from utils import load_metrics, load_yaml, parse_objective
+
+# pydantic validation & typing
+from pydantic import BaseModel
+
+# -------------------------
+# Risk & detection helpers
+# -------------------------
+def compute_recent_and_baseline(series: pd.Series, window_minutes: int):
+    # assumes series index is datetime-sorted
+    now = series.index.max()
+    recent_start = now - pd.Timedelta(minutes=window_minutes)
+    baseline_end = recent_start - pd.Timedelta(seconds=1)
+    baseline_start = baseline_end - pd.Timedelta(minutes=window_minutes)
+    recent = series[recent_start: now]
+    baseline = series[baseline_start: baseline_end]
+    return recent, baseline
+
+def detect_drift(baseline: pd.Series, recent: pd.Series):
+    # Kolmogorov-Smirnov test (nonparametric)
+    if len(baseline) < 10 or len(recent) < 10:
+        return {"drift": False, "pvalue": 1.0}
+    stat, pvalue = ks_2samp(baseline.dropna(), recent.dropna())
+    return {"drift": pvalue < 0.05, "pvalue": float(pvalue), "stat": float(stat)}
+
+def forecast_series(series: pd.Series, horizon_minutes: int, freq_minutes=1):
+    # Use a simple ARIMA model on the aggregated minute-level series.
+    # Returns a forecast index and values.
+    series = series.asfreq(f"{freq_minutes}T").fillna(method="ffill").fillna(method="bfill")
+    # Use log transform carefully for positive-only metrics (wrap in try)
+    vals = series.values
+    if len(vals) < 10:
+        return series.index, series.values  # not enough data
+    try:
+        model = ARIMA(vals, order=(2,1,0))
+        res = model.fit()
+        steps = int(horizon_minutes / freq_minutes)
+        pred = res.forecast(steps=steps)
+        last_index = series.index.max()
+        idx = pd.date_range(start=last_index + pd.Timedelta(minutes=freq_minutes),
+                            periods=steps, freq=f"{freq_minutes}T")
+        return idx, np.array(pred)
+    except Exception as e:
+        # fallback: naive persistence + linear trend
+        slope = (vals[-1]-vals[0]) / max(len(vals)-1,1)
+        steps = int(horizon_minutes / freq_minutes)
+        idx = pd.date_range(start=series.index.max() + pd.Timedelta(minutes=freq_minutes),
+                            periods=steps, freq=f"{freq_minutes}T")
+        pred = vals[-1] + slope * np.arange(1, steps+1)
+        return idx, pred
+
+def compute_risk_score(current_value, threshold, drift_pvalue, forecast_vals, direction='<=' ):
+    # Simple scoring: closeness + drift + forecast breach probability
+    # closeness: normalized distance (0..1)
+    if direction in ('<=','<'):
+        closeness = max(0.0, min(1.0, 1.0 - (threshold - current_value) / max(threshold,1.0)))
+        # forecast breach flag
+        fbreach = float((forecast_vals > threshold).mean())
+    else:
+        closeness = max(0.0, min(1.0, 1.0 - (current_value - threshold) / max(current_value,1.0)))
+        fbreach = float((forecast_vals < threshold).mean())
+
+    drift_factor = 1.0 if drift_pvalue < 0.05 else 0.0
+    # risk score in 0..100
+    score = (0.6 * closeness + 0.25 * fbreach + 0.15 * drift_factor) * 100
+    return float(score)
+
+# -------------------------
+# LLM mitigation generation
+# -------------------------
+LLM_TOOL_WHITELIST = [
+    "explain", "suggest_mitigation", "no_action"
+]
+
+LLM_PROMPT_TEMPLATE = """
+You are SLOWA: an on-call assistant that only produces advisory text — NO REMOTE ACTIONS, NO RUNBOOK EXECUTION.
+Tooling: allowed tool keywords = {tools}
+
+SLO context:
+- slo_id: {slo_id}
+- metric: {metric}
+- objective: {objective}
+- current_value: {current_value}
+- recent_mean: {recent_mean}
+- drift_pvalue: {drift_pvalue}
+- forecast_summary: {forecast_summary}
+- topology_summary: {topology_summary}
+
+Produce:
+1) A concise risk summary (2-4 sentences).
+2) A prioritized, actionable mitigation plan (bullet list). Each item must include:
+   - short description
+   - expected effect
+   - effort (low/medium/high)
+   - verification steps (what to check after)
+3) Suggested monitoring queries or dashboards to add (promql or pseudo).
+4) A clear "do not perform" note reminding human operator that the system will not take remote actions.
+
+Be conservative and explicitly mention human approval requirement.
+"""
+
+def generate_mitigation(llm, context: dict):
+    prompt = LLM_PROMPT_TEMPLATE.format(
+        tools=", ".join(LLM_TOOL_WHITELIST),
+        slo_id=context["slo_id"],
+        metric=context["metric"],
+        objective=context["objective"],
+        current_value=context["current_value"],
+        recent_mean=context["recent_mean"],
+        drift_pvalue=context["drift"]["pvalue"],
+        forecast_summary=context["forecast_summary"],
+        topology_summary=context["topology_summary"],
+    )
+    # Guardrail: ask model to only respond with JSON-like envelope (but still parse text)
+    resp = llm.invoke([{"role":"system","content":"You are SLOWA; behave per the instructions."},
+                       {"role":"user","content":prompt}])
+    return str(resp)
+
+# -------------------------
+# Main orchestration
+# -------------------------
+def run(data_dir: str, out_dir: str, model_name="llama2:7b"):
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Load files
+    metrics = load_metrics(os.path.join(data_dir, "metrics*.csv"))
+    if metrics.empty:
+        print("No metrics found in", data_dir)
+        return
+    metrics['timestamp'] = pd.to_datetime(metrics['timestamp'])
+    metrics = metrics.sort_values('timestamp')
+    metrics = metrics.set_index('timestamp')
+
+    slo_yaml = load_yaml(os.path.join(data_dir, "slo_targets.yml"))
+    slo_config = SLOTargetsFile(**slo_yaml)
+
+    topology = load_yaml(os.path.join(data_dir, "topology.json")) if os.path.exists(os.path.join(data_dir, "topology.json")) else {}
+
+    # Initialize LLM (guarded)
+    try:
+        llm = make_llm(model_name)
+    except Exception as e:
+        print("LLM init error:", e)
+        llm = None
+
+    results = []
+    for slo in slo_config.slo_targets:
+        metric = slo.metric
+        window = slo.window_minutes
+        horizon = slo.forecast_horizon_minutes
+        dir_op, thresh = parse_objective(slo.objective)
+
+        series = metrics[metrics['metric_name']==metric].groupby(pd.Grouper(freq='1T'))['value'].mean()
+        if series.dropna().empty:
+            print("No data points for metric", metric)
+            continue
+
+        recent, baseline = compute_recent_and_baseline(series, window)
+        drift = detect_drift(baseline, recent)
+        idx, forecast_vals = forecast_series(series, horizon)
+        current_value = float(series.dropna().iloc[-1])
+        forecast_summary = {
+            "next_vals_mean": float(np.mean(forecast_vals)),
+            "max": float(np.max(forecast_vals)),
+            "min": float(np.min(forecast_vals))
+        }
+        score = compute_risk_score(current_value, thresh, drift['pvalue'], forecast_vals, direction=dir_op)
+
+        # Save chart
+        fig, ax = plt.subplots(figsize=(8,3))
+        series[-window*2:].plot(ax=ax, label='history')
+        pd.Series(index=idx, data=forecast_vals).plot(ax=ax, label='forecast', linestyle='--')
+        ax.axhline(thresh, color='k', linestyle=':', label='threshold')
+        ax.set_title(f"SLO {slo.id} ({metric}) Risk {score:.1f}")
+        ax.legend()
+        chart_path = os.path.join(out_dir, f"{slo.id}_forecast.png")
+        fig.savefig(chart_path, bbox_inches='tight')
+        plt.close(fig)
+
+        # Compose context for LLM
+        context = {
+            "slo_id": slo.id,
+            "metric": metric,
+            "objective": slo.objective,
+            "current_value": current_value,
+            "recent_mean": float(recent.mean()) if not recent.empty else current_value,
+            "drift": drift,
+            "forecast_summary": forecast_summary,
+            "topology_summary": topology or {}
+        }
+
+        mitigation = None
+        if llm:
+            try:
+                mitigation = generate_mitigation(llm, context)
+            except Exception as e:
+                mitigation = f"LLM error: {e}"
+
+        item = {
+            "slo_id": slo.id,
+            "metric": metric,
+            "risk_score": score,
+            "drift": drift,
+            "forecast_summary": forecast_summary,
+            "chart": chart_path,
+            "mitigation": mitigation
+        }
+        results.append(item)
+
+    # Save outputs
+    with open(os.path.join(out_dir, "risk_report.json"), "w") as fh:
+        json.dump(results, fh, indent=2)
+    with open(os.path.join(out_dir, "mitigations.txt"), "w") as fh:
+        for r in results:
+            fh.write(f"=== {r['slo_id']} ===\n")
+            fh.write((r['mitigation'] or "No mitigation generated") + "\n\n")
+
+    print("Done. Outputs under", out_dir)
+
+# CLI
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data-dir", default="data")
+    parser.add_argument("--out-dir", default="out")
+    parser.add_argument("--model", default="llama2:7b")
+    args = parser.parse_args()
+    run(args.data_dir, args.out_dir, args.model)
+
