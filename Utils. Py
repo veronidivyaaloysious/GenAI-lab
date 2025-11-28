@@ -1,0 +1,33 @@
+src/utils.py
+
+import os, json, glob
+import pandas as pd
+import yaml
+from typing import List
+from datetime import datetime
+from pydantic import ValidationError
+
+def load_metrics(paths_pattern: str):
+    rows = []
+    for f in glob.glob(paths_pattern):
+        df = pd.read_csv(f, parse_dates=['timestamp'])
+        rows.append(df)
+    if not rows:
+        return pd.DataFrame()
+    return pd.concat(rows, ignore_index=True)
+
+def load_yaml(path: str):
+    with open(path,'r') as fh:
+        return yaml.safe_load(fh)
+
+def parse_objective(obj: str):
+    obj = obj.strip()
+    if obj.startswith("<="):
+        return "<=", float(obj[2:].strip())
+    if obj.startswith("<"):
+        return "<", float(obj[1:].strip())
+    if obj.startswith(">="):
+        return ">=", float(obj[2:].strip())
+    if obj.startswith(">"):
+        return ">", float(obj[1:].strip())
+    raise ValueError(f"Unsupported objective format: {obj}")
