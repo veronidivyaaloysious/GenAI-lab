@@ -1,0 +1,20 @@
+
+
+src/models.py (pydantic schemas)
+
+from pydantic import BaseModel, Field
+from typing import List, Optional
+
+class SLOTarget(BaseModel):
+    id: str
+    metric: str
+    objective: str  # e.g., "<= 300" or "<= 0.01"
+    window_minutes: int = 60
+    forecast_horizon_minutes: int = 60
+
+class SLOTargetsFile(BaseModel):
+    slo_targets: List[SLOTarget]
+
+class Topology(BaseModel):
+    services: List[dict]
+    dependencies: List[dict]
